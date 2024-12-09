@@ -1,0 +1,431 @@
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <LiquidCrystal_PCF8574.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ArduinoJson.h>
+
+// Конфигурация дисплея
+LiquidCrystal_PCF8574 display(0x27);
+
+// Конфигурация сети
+const char* wifi_ssid = "ESP8266";
+const char* wifi_pass = "123456789";
+
+// Конфигурация MQTT
+const char* mqtt_host = "jcddef63.ala.eu-central-1.emqxsl.com";
+const char* mqtt_user = "mqtt_user";
+const char* mqtt_pass = "mqtt_pass";
+const int mqtt_port = 8883;
+
+// Топики
+const char* temp_topic = "sensor/temperature";  // Возвращаем оригинальное имя
+const char* message_topic = "display/text";     // Возвращаем оригинальное имя
+const char* device_id = "esp8266_client";      // Возвращаем оригинальное имя
+const char* vision_topic = "vision/objects";
+
+// Глобальные переменные для скроллинга
+unsigned long last_scroll = 0;
+int scroll_pos = 0;
+String vision_text = "";
+unsigned long last_vision_update = 0;
+
+const unsigned long UPDATE_INTERVAL = 2000;
+const unsigned long SCROLL_DELAY = 800;
+
+
+const unsigned long VISION_UPDATE_DELAY = 800;
+unsigned long last_vision_display_update = 0;
+String current_vision_display = "";
+String display_text = "";
+
+const unsigned long SPEECH_SCROLL_INTERVAL = 800;
+unsigned long lastSpeechScrollTime = 0;
+int speechScrollPosition = 0;
+String fullSpeechText = "";
+const unsigned long SCROLL_INTERVAL = 800;
+int scrollPosition = 0;
+
+unsigned long last_message_scroll = 0;
+int message_scroll_pos = 0;
+
+byte polishChars[8][8] = {
+    { 0x00, 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x01 },  // ą
+    { 0x02, 0x04, 0x0E, 0x11, 0x10, 0x11, 0x0E, 0x00 },  // ć
+    { 0x00, 0x0E, 0x11, 0x10, 0x1F, 0x11, 0x0E, 0x02 },  // ę
+    { 0x01, 0x02, 0x04, 0x08, 0x04, 0x02, 0x11, 0x0E },  // ł
+    { 0x02, 0x04, 0x11, 0x13, 0x15, 0x19, 0x11, 0x00 },  // ń
+    { 0x02, 0x04, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00 },    // ó
+    { 0x02, 0x04, 0x0E, 0x10, 0x0E, 0x01, 0x1E, 0x00 },  // ś
+    { 0x02, 0x04, 0x11, 0x11, 0x0A, 0x04, 0x08, 0x00 }   // ź
+};
+
+// Функция для преобразования польских символов
+String convertSpecialChars(String input) {
+    String output = "";
+    for (unsigned int i = 0; i < input.length(); i++) {
+        if (i + 1 < input.length()) {
+            uint8_t c1 = input[i];
+            uint8_t c2 = input[i + 1];
+
+            if (c1 == 0xC3 && c2 == 0xB3) {
+                output += char(5);
+                i++;
+                continue;
+            }
+
+            if (c1 == 0xC4 || c1 == 0xC5) {
+                switch ((c1 << 8) | c2) {
+                    case 0xC485: output += char(0); i++; continue;
+                    case 0xC487: output += char(1); i++; continue;
+                    case 0xC499: output += char(2); i++; continue;
+                    case 0xC582: output += char(3); i++; continue;
+                    case 0xC584: output += char(4); i++; continue;
+                    case 0xC59B: output += char(6); i++; continue;
+                    case 0xC5BA: output += char(7); i++; continue;
+                }
+            }
+        }
+        output += input[i];
+    }
+    return output;
+}
+// Определение пина для датчика температуры
+#define TEMP_SENSOR_PIN 0
+OneWire oneWire(TEMP_SENSOR_PIN);
+DallasTemperature sensors(&oneWire);
+
+// Сертификат встроенный в код
+const char* root_ca = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDrzCCApegAwIBAgIQCDvgVpBCRrGhdWrJWZHHSjANBgkqhkiG9w0BAQUFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBD
+QTAeFw0wNjExMTAwMDAwMDBaFw0zMTExMTAwMDAwMDBaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IENBMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4jvhEXLeqKTTo1eqUKKPC3eQyaKl7hLOllsB
+CSDMAZOnTjC3U/dDxGkAV53ijSLdhwZAAIEJzs4bg7/fzTtxRuLWZscFs3YnFo97
+nh6Vfe63SKMI2tavegw5BmV/Sl0fvBf4q77uKNd0f3p4mVmFaG5cIzJLv07A6Fpt
+43C/dxC//AH2hdmoRBBYMql1GNXRor5H4idq9Joz+EkIYIvUX7Q6hL+hqkpMfT7P
+T19sdl6gSzeRntwi5m3OFBqOasv+zbMUZBfHWymeMr/y7vrTC0LUq7dBMtoM1O/4
+gdW7jVg/tRvoSSiicNoxBN33shbyTApOB6jtSj1etX+jkMOvJwIDAQABo2MwYTAO
+BgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUA95QNVbR
+TLtm8KPiGxvDl7I90VUwHwYDVR0jBBgwFoAUA95QNVbRTLtm8KPiGxvDl7I90VUw
+DQYJKoZIhvcNAQEFBQADggEBAMucN6pIExIK+t1EnE9SsPTfrgT1eXkIoyQY/Esr
+hMAtudXH/vTBH1jLuG2cenTnmCmrEbXjcKChzUyImZOMkXDiqw8cvpOp/2PV5Adg
+06O/nVsJ8dWO41P0jmP6P6fbtGbfYmbW0W5BjfIttep3Sp+dWOIrWcBAI+0tKIJF
+PnlUkiaY4IBIqDfv8NZ5YBberOgOzW6sRBc4L0na4UU+Krk2U886UAb3LujEV0ls
+YSEY1QSteDwsOoBrp+uvFRTp2InBuThs4pFsiv9kuXclVzDAGySj4dzp30d8tbQk
+CAUw7C29C79Fv1C5qfPrmAESrciIxpg0X40KPMbp1ZWVbd4=
+-----END CERTIFICATE-----
+)EOF";
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+
+
+
+// Функции для работы с WiFi и временем
+void initWiFi() {
+    Serial.println("Connecting to WiFi...");
+    WiFi.begin(wifi_ssid, wifi_pass);
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected");
+        Serial.println("IP: " + WiFi.localIP().toString());
+    } else {
+        Serial.println("\nWiFi connection failed");
+    }
+}
+
+bool syncTimeWithNTP() {
+    Serial.println("Synchronizing time...");
+    configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+    time_t now = time(nullptr);
+    int attempts = 0;
+    while (now < 24 * 3600 && attempts < 10) {
+        delay(500);
+        now = time(nullptr);
+        attempts++;
+    }
+
+    if (now > 24 * 3600) {
+        struct tm timeinfo;
+        gmtime_r(&now, &timeinfo);
+        Serial.printf("Time sync successful: %02d:%02d:%02d\n",
+                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        return true;
+    }
+    return false;
+}
+
+// Обработчик MQTT сообщений
+void handleMQTTMessage(char* topic, byte* payload, unsigned int length) {
+    Serial.printf("Message received [%s]: ", topic);
+    for (unsigned int i = 0; i < length; i++) {
+        Serial.print((char)payload[i]);
+    }
+    Serial.println();
+
+    // Создаем буфер для сообщения
+    char message[length + 1];
+    memcpy(message, payload, length);
+    message[length] = '\0';
+
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, message);
+
+    if (error) {
+        Serial.println("JSON parsing failed");
+        return;
+    }
+
+    // Обработка текстовых сообщений
+    if (String(topic) == String(message_topic)) {
+        if (doc.containsKey("text")) {
+            String text = doc["text"].as<String>();
+            text = convertSpecialChars(text);
+
+            display.clear();  // Очищаем экран перед отображением нового текста
+
+            if (text.length() <= 16) {
+                display.setCursor(0, 0);
+                display.print(text);
+            } else {
+                display_text = text;
+                message_scroll_pos = 0;
+                display.setCursor(0, 0);
+                display.print(text.substring(0, 16));
+            }
+
+            Serial.println("Display updated with message");
+        } else {
+            Serial.println("Message contains no text key");
+        }
+    }
+
+    // Обработка данных визуального распознавания
+      else if (String(topic) == vision_topic) {
+          if (doc.containsKey("objects")) {
+              String objects = "";
+              JsonObject data = doc["objects"];
+              for (JsonPair p : data) {
+                  if (objects.length() > 0) objects += " ";
+                  objects += String(p.key().c_str()) + ":" + String(p.value().as<int>());
+              }
+
+              // Проверяем, изменились ли данные
+              if (objects != vision_text) {
+                  vision_text = objects;
+                  scroll_pos = 0;
+
+                  // Обновляем дисплей только если прошло достаточно времени
+                  unsigned long current_time = millis();
+                  if (current_time - last_vision_display_update >= VISION_UPDATE_DELAY) {
+                      last_vision_display_update = current_time;
+
+                      display.setCursor(0, 1);
+                      display.print("                "); // Очищаем вторую строку
+                      display.setCursor(0, 1);
+
+                      if (vision_text.length() <= 16) {
+                          display.print(vision_text);
+                      } else {
+                          display.print(vision_text.substring(0, 16));
+                      }
+                      current_vision_display = vision_text;
+                  }
+              }
+          }
+      }
+}
+
+// Функция переподключения к MQTT
+void reconnectMQTT() {
+    while (!client.connected()) {
+        Serial.print("Connecting to MQTT...");
+        if (client.connect(device_id, mqtt_user, mqtt_pass)) {
+            Serial.println("connected");
+            client.subscribe(message_topic);
+            client.subscribe(vision_topic);
+
+            display.clear();
+            display.print("MQTT Connected");
+        } else {
+            Serial.println("failed, retrying...");
+            delay(3000);
+        }
+    }
+}
+
+// Функции скроллинга текста
+void scrollMessage() {
+    if (display_text.length() > 16) {  // Используем display_text вместо fullSpeechText
+        unsigned long currentTime = millis();
+        if (currentTime - last_message_scroll >= SCROLL_DELAY) {
+            last_message_scroll = currentTime;
+
+            message_scroll_pos++;  // Используем message_scroll_pos
+
+            // Сброс позиции с паузой
+            if (message_scroll_pos > display_text.length()) {
+                message_scroll_pos = 0;
+                delay(1000); // Пауза между повторами
+            }
+
+            // Формируем строку для отображения
+            String displayString;
+            if (message_scroll_pos + 16 <= display_text.length()) {
+                displayString = display_text.substring(message_scroll_pos, message_scroll_pos + 16);
+            } else {
+                // Добавляем пробелы между повторами текста
+                displayString = display_text.substring(message_scroll_pos) + "    " +
+                              display_text.substring(0, 16 - (display_text.length() - message_scroll_pos));
+            }
+
+            // Дополняем пробелами если нужно
+            while (displayString.length() < 16) {
+                displayString += " ";
+            }
+
+            // Отображаем на LCD
+            display.setCursor(0, 0);
+            display.print(displayString);
+        }
+    }
+}
+
+
+void scrollVisionData() {
+    if (vision_text.length() > 16) {
+        unsigned long currentTime = millis();
+        if (currentTime - last_scroll >= SCROLL_DELAY) {  // Используем SCROLL_DELAY
+            last_scroll = currentTime;
+
+            scroll_pos++;  // Используем существующую переменную
+
+            if (scroll_pos > vision_text.length()) {
+                scroll_pos = 0;
+                delay(1000);
+            }
+
+            String displayString;
+            if (scroll_pos + 16 <= vision_text.length()) {
+                displayString = vision_text.substring(scroll_pos, scroll_pos + 16);
+            } else {
+                displayString = vision_text.substring(scroll_pos) + "    " +
+                              vision_text.substring(0, 16 - (vision_text.length() - scroll_pos));
+            }
+
+            while (displayString.length() < 16) {
+                displayString += " ";
+            }
+
+            display.setCursor(0, 1);
+            display.print(displayString);
+        }
+    }
+}
+
+
+// Инициализация устройства
+void setup() {
+    Serial.begin(115200);
+
+    // Инициализация I2C и дисплея
+    Wire.begin(D2, D1);
+    Wire.beginTransmission(0x27);  // Добавляем явную проверку
+    delay(100);  // Добавляем задержку
+
+    if (Wire.endTransmission() == 0) {
+        display.begin(16, 2);
+        delay(100);  // Добавляем задержку после begin
+        display.setBacklight(255);
+
+        // Загрузка специальных символов
+        for (int i = 0; i < 8; i++) {
+            display.createChar(i, polishChars[i]);
+        }
+
+        display.clear();
+        display.print("System Starting");
+    } else {
+        Serial.println("Display not found!");
+    }
+
+    // Инициализация датчика температуры
+    sensors.begin();
+
+    // Настройка WiFi и MQTT
+    initWiFi();
+    if (!syncTimeWithNTP()) {
+        Serial.println("Time sync failed");
+    }
+
+    // Настройка SSL
+    X509List *cert = new X509List(root_ca);
+    espClient.setTrustAnchors(cert);
+    espClient.setBufferSizes(512, 512);
+    espClient.setTimeout(15000);
+
+    client.setServer(mqtt_host, mqtt_port);
+    client.setCallback(handleMQTTMessage);
+}
+
+// Основной цикл
+void loop() {
+    // Проверка подключения к WiFi
+    if (WiFi.status() != WL_CONNECTED) {
+        display.setCursor(0, 0);
+        display.print("WiFi Connecting");
+        initWiFi();
+    }
+
+    // Проверка подключения к MQTT
+    if (!client.connected()) {
+        reconnectMQTT();
+    }
+    client.loop();
+
+    // Обновление дисплея
+    scrollMessage();
+    scrollVisionData();
+
+    // Отправка данных температуры
+    static unsigned long lastTemp = 0;
+    if (millis() - lastTemp > 5000) {
+        lastTemp = millis();
+
+        sensors.requestTemperatures();
+        float temp = sensors.getTempCByIndex(0);
+
+        if (temp != DEVICE_DISCONNECTED_C) {
+            StaticJsonDocument<64> doc;
+            doc["device"] = device_id;
+            doc["temperature"] = temp;
+
+            char buffer[64];
+            serializeJson(doc, buffer);
+
+            if (client.publish(temp_topic, buffer)) {
+                Serial.println("Temperature sent: " + String(temp));
+            }
+        } else {
+            Serial.println("Temperature sensor error");
+            display.setCursor(0, 0);
+            display.print("Sensor Error");
+        }
+    }
+}

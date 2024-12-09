@@ -1,0 +1,94 @@
+version: '3.8'  # Обновляем версию для использования новых функций
+
+services:
+  influxdb:
+    image: influxdb:2.7
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123
+      - DOCKER_INFLUXDB_INIT_ORG=myorg
+      - DOCKER_INFLUXDB_INIT_BUCKET=iot_data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-admin-token
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - iot-network
+    restart: unless-stopped
+
+  subscriber:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    volumes:
+      - ./emqxsl-ca.crt:/app/emqxsl-ca.crt:ro
+      - ./logs:/app/logs  # Добавляем volume для логов
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=my-super-secret-admin-token
+      - INFLUXDB_ORG=myorg
+      - INFLUXDB_BUCKET=iot_data
+      - MQTT_BROKER=u6edac82.ala.us-east-1.emqxsl.com  # Обновленный брокер
+      - MQTT_PORT=8883
+      - MQTT_USERNAME=test_user  # Обновленные креды
+      - MQTT_PASSWORD=test_pass
+      - TZ=UTC  # Добавляем временную зону
+    networks:
+      - iot-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3010:3000"  # Внешний порт 3010 маппится на внутренний 3000
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    environment:
+      - GF_SERVER_HTTP_PORT=3000  # Добавляем явное указание порта
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+      - TZ=UTC
+    networks:
+      - iot-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+
+networks:
+  iot-network:
+    driver: bridge
+
+volumes:
+  influxdb-data:
+    driver: local
+  influxdb-config:
+    driver: local
+  grafana-data:
+    driver: local
