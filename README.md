@@ -1,5 +1,8 @@
 # IoT and Video Analysis Framework
 
+## Authors: Daniil Khabichau, Mikhail Skrobat
+
+
 ## Overview
 This repository contains three Python scripts designed for IoT integration and real-time data analysis:
 
